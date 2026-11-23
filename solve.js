@@ -965,43 +965,93 @@ function trimSp(l, a) {
   return a === 0 && b === l.length ? l : l.slice(a, b);
 }
 
-/** lib/markdown.js's renderMarkdown on an escaped-domain body `E` (no tab in it): { html, toc, excerpt }. */
+// Within a paragraph's lines after the first: a line that may end the paragraph (a fence, a heading, a rule, a line of
+// spaces) or that needs trimming (it starts with a space), and any line that ends with a space. A run of lines holding
+// none of these is one paragraph exactly as it stands.
+const PARA_SLOW = /\\n(?:[ `#]|---|\*\*\*)| (?:\\n|$)/;
+
+/** Where the line read last by lineOf ends in the body (the offset of its \n, or the body's length). */
+let LE = 0;
+
+/** The line of the escaped-domain body `E` that starts at `pos` (pos <= E.length), LE set to its end. */
+function lineOf(E, pos) {
+  const k = E.indexOf('\\n', pos);
+  LE = k === -1 ? E.length : k;
+  return E.slice(pos, LE);
+}
+
+/**
+ * lib/markdown.js's renderMarkdown on an escaped-domain body `E` (no tab in it): { html, toc, excerpt }. The body is
+ * walked by offset: a line starts at `pos`, and one exists while pos <= E.length (the last may be empty). A backslash
+ * in E is always the \n that ends a line, so a line that starts with one is empty.
+ */
 function renderMarkdownE(E, link) {
-  const lines = E.split('\\n');
-  const nLines = lines.length;
+  const n = E.length;
   let ids = null;
   let html = '';
   const toc = [];
   let excerpt = null;
-  let i = 0;
-  let off = 0; // where lines[i] starts in E
-  while (i < nLines) {
-    const line = lines[i];
-    const len = line.length;
-    const c0 = len === 0 ? -1 : line.charCodeAt(0);
-    if (c0 === -1 || (c0 === 32 && allSpaces(line))) {
-      i++;
-      off += len + 2;
+  let pos = 0;
+  while (pos <= n) {
+    const c0 = pos === n ? 92 : E.charCodeAt(pos);
+    if (c0 === 92) {
+      pos += 2;
+      continue;
+    }
+    // A paragraph that cannot be anything else by its first character: when the lines up to the next empty one need
+    // no trimming and none of them ends it early, it is that run of the body as it stands, its \n escapes included.
+    // (A space, a backtick, a # or a digit may start something else; so may &gt;, and a - or * that is followed by a
+    // space, a list item, or that starts --- or ***, a rule.)
+    let plainStart = c0 !== 32 && c0 !== 96 && c0 !== 35 && (c0 < 48 || c0 > 57);
+    if (plainStart) {
+      if (c0 === 38) plainStart = !E.startsWith('&gt;', pos);
+      else if (c0 === 45 || c0 === 42) {
+        const c1 = E.charCodeAt(pos + 1);
+        plainStart = c1 !== 32 && !(c1 === c0 && E.charCodeAt(pos + 2) === c0);
+      }
+    }
+    if (plainStart) {
+      let end = E.indexOf('\\n\\n', pos);
+      let next;
+      if (end === -1) {
+        end = n;
+        next = n + 2;
+        if (E.charCodeAt(n - 1) === 110 && E.charCodeAt(n - 2) === 92) end = n - 2;
+      } else next = end + 4;
+      const chunk = E.slice(pos, end);
+      if (!PARA_SLOW.test(chunk)) {
+        const h = inlineE(chunk, link);
+        if (excerpt === null) excerpt = h;
+        html += `<p>${h}</p>\\n`;
+        pos = next;
+        continue;
+      }
+    }
+    const line = lineOf(E, pos);
+    const len = LE - pos;
+    if (c0 === 32 && allSpaces(line)) {
+      pos = LE + 2;
       continue;
     }
     if (c0 === 96) {
       const m = FENCE_OPEN_E.exec(line);
       if (m !== null) {
-        i++;
-        off += len + 2;
-        const start = off;
+        pos = LE + 2;
+        const start = pos;
         let end = -1;
-        while (i < nLines && !(lines[i].charCodeAt(0) === 96 && FENCE_CLOSE_E.test(lines[i]))) {
-          end = off + lines[i].length;
-          off = end + 2;
-          i++;
+        let closed = false;
+        while (pos <= n) {
+          if (E.charCodeAt(pos) === 96 && FENCE_CLOSE_E.test(lineOf(E, pos))) {
+            closed = true;
+            break;
+          }
+          const k = E.indexOf('\\n', pos);
+          end = k === -1 ? n : k;
+          pos = end + 2;
         }
         const cls = m[1] === '' ? '' : ` class=\\"language-${m[1]}\\"`;
         html += end === -1 ? `<pre><code${cls}></code></pre>\\n` : `<pre><code${cls}>${bsOut(E.slice(start, end))}\\n</code></pre>\\n`;
-        if (i < nLines) {
-          off += lines[i].length + 2;
-          i++;
-        }
+        if (closed) pos = LE + 2;
         continue;
       }
     }
@@ -1016,29 +1066,28 @@ function renderMarkdownE(E, link) {
         const h = inlineE(text, link);
         html += `<h${depth} id=\\"${id}\\">${h}</h${depth}>\\n`;
         if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: jv(h) });
-        i++;
-        off += len + 2;
+        pos = LE + 2;
         continue;
       }
     }
     if ((c0 === 45 || c0 === 42) && HR_E.test(line)) {
       html += '<hr>\\n';
-      i++;
-      off += len + 2;
+      pos = LE + 2;
       continue;
     }
     if (c0 === 38 && line.startsWith('&gt;')) {
       let body = '';
       let any = false;
-      while (i < nLines && lines[i].startsWith('&gt;')) {
-        const l = lines[i];
+      let l = line;
+      for (;;) {
         const t = trimSp(l, l.charCodeAt(4) === 32 ? 5 : 4);
         if (t !== '') {
           body = any ? `${body}\\n${t}` : t;
           any = true;
         }
-        off += l.length + 2;
-        i++;
+        pos = LE + 2;
+        if (pos > n || !E.startsWith('&gt;', pos)) break;
+        l = lineOf(E, pos);
       }
       html += any ? `<blockquote>\\n<p>${inlineE(body, link)}</p>\\n</blockquote>\\n` : '<blockquote>\\n</blockquote>\\n';
       continue;
@@ -1050,25 +1099,28 @@ function renderMarkdownE(E, link) {
         const ordered = !bullet;
         let items = '';
         let item = ordered ? trimSp(m[2], 0) : trimSp(line, 2);
-        i++;
-        off += len + 2;
-        while (i < nLines) {
-          const l = lines[i];
-          const d0 = l.charCodeAt(0);
+        pos = LE + 2;
+        while (pos <= n) {
+          // The next line's first two characters, read in place: an empty line reads as its own \n, which is none of these.
+          const d0 = E.charCodeAt(pos);
+          const d1 = E.charCodeAt(pos + 1);
           let t = null;
           if (ordered) {
             if (d0 >= 48 && d0 <= 57) {
-              const mm = ORDERED_E.exec(l);
-              if (mm !== null) t = trimSp(mm[2], 0);
+              const mm = ORDERED_E.exec(lineOf(E, pos));
+              if (mm === null) break;
+              t = trimSp(mm[2], 0);
             }
-          } else if ((d0 === 45 || d0 === 42) && l.charCodeAt(1) === 32) t = trimSp(l, 2);
+          } else if ((d0 === 45 || d0 === 42) && d1 === 32) t = trimSp(lineOf(E, pos), 2);
           if (t !== null) {
             items += `<li>${inlineE(item, link)}</li>\\n`;
             item = t;
-          } else if (d0 === 32 && l.charCodeAt(1) === 32 && !allSpaces(l)) item += `\\n${trimSp(l, 0)}`;
-          else break;
-          off += l.length + 2;
-          i++;
+          } else if (d0 === 32 && d1 === 32) {
+            const l = lineOf(E, pos);
+            if (allSpaces(l)) break;
+            item += `\\n${trimSp(l, 0)}`;
+          } else break;
+          pos = LE + 2;
         }
         items += `<li>${inlineE(item, link)}</li>\\n`;
         const start = ordered ? Number(m[1]) : 1;
@@ -1082,17 +1134,16 @@ function renderMarkdownE(E, link) {
     let b = len;
     while (a < b && line.charCodeAt(a) === 32) a++;
     while (b > a && line.charCodeAt(b - 1) === 32) b--;
-    const first = off + a;
-    let endOff = off + b;
+    const first = pos + a;
+    let endOff = pos + b;
     let prevFull = b === len;
     let text = null;
-    i++;
-    off += len + 2;
-    while (i < nLines) {
-      const l = lines[i];
-      const ll = l.length;
-      if (ll === 0) break;
-      const d0 = l.charCodeAt(0);
+    pos = LE + 2;
+    while (pos <= n) {
+      const d0 = pos === n ? 92 : E.charCodeAt(pos);
+      if (d0 === 92) break;
+      const l = lineOf(E, pos);
+      const ll = LE - pos;
       if (d0 === 96) {
         if (FENCE_OPEN_E.test(l)) break;
       } else if (d0 === 35) {
@@ -1106,12 +1157,11 @@ function renderMarkdownE(E, link) {
       while (a < b && l.charCodeAt(a) === 32) a++;
       while (b > a && l.charCodeAt(b - 1) === 32) b--;
       if (text === null) {
-        if (prevFull && a === 0) endOff = off + b;
+        if (prevFull && a === 0) endOff = pos + b;
         else text = `${E.slice(first, endOff)}\\n${l.slice(a, b)}`;
       } else text += `\\n${l.slice(a, b)}`;
       prevFull = b === ll;
-      off += ll + 2;
-      i++;
+      pos = LE + 2;
     }
     if (text === null) text = E.slice(first, endOff);
     const h = inlineE(text, link);
