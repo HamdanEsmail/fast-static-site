@@ -161,6 +161,19 @@ let slugCache = new Map();
 
 const NOT_SLUG = /[^a-z0-9]+/g;
 const NOT_SLUG_ANY = /[^A-Za-z0-9]+/g;
+const UTF8_CHAR = /[\xc0-\xff][\x80-\xbf]*/g;
+const NOT_ASCII_G = /[^\u0000-\u007f]+/g;
+let foldCache = new Map();
+
+/** What NFKD and the dropping of marks leave of one character (`m`, its UTF-8 bytes); what is not ASCII of it, a space. */
+function foldChar(m) {
+  let r = foldCache.get(m);
+  if (r === undefined) {
+    r = Buffer.from(m, 'latin1').toString('utf8').normalize('NFKD').replace(MARKS, '').replace(NOT_ASCII_G, ' ');
+    foldCache.set(m, r);
+  }
+  return r;
+}
 const NOT_ASCII = /[^\u0000-\u007f]/;
 
 function slugifyRaw(text) {
@@ -174,8 +187,11 @@ function slugifyRaw(text) {
     return e === a ? 'untitled' : a === 0 && e === r.length ? r : r.slice(a, e);
   }
   // Decomposed and its marks dropped, every run of anything but ASCII letters and digits becomes one "-": what is
-  // left is ASCII, so lowering it lowers A-Z and nothing else. Then as above.
-  const r = chars(text).normalize('NFKD').replace(MARKS, '').replace(NOT_SLUG_ANY, '-').toLowerCase();
+  // left is ASCII, so lowering it lowers A-Z and nothing else. Then as above. In byte mode each character that is
+  // not ASCII (its UTF-8 bytes) is folded by itself and remembered: decomposition goes character by character, and
+  // the marks, the only characters it reorders, are dropped anyway.
+  const plain = BYTE ? text.replace(UTF8_CHAR, foldChar) : text.normalize('NFKD').replace(MARKS, '');
+  const r = plain.replace(NOT_SLUG_ANY, '-').toLowerCase();
   const a = r.charCodeAt(0) === 45 ? 1 : 0;
   let e = r.length;
   if (e - a > SLUG_MAX) e = a + SLUG_MAX;
@@ -1405,14 +1421,30 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+/**
+ * A property's value that is worked out when a template first reads it, f(s): a card's excerpt and reading minutes
+ * (which need the post's body rendered). prop and walk, the only ways a template reads a property, put the value in
+ * its place, so nothing else ever meets one. (An object literal with getters would do the same, far more slowly.)
+ */
+class Lazy {
+  constructor(f, s) {
+    this.f = f;
+    this.s = s;
+  }
+}
+
 function prop(v, k) {
-  return v !== null && typeof v === 'object' && hasOwn(v, k) ? v[k] : undefined;
+  if (v === null || typeof v !== 'object' || !hasOwn(v, k)) return undefined;
+  const x = v[k];
+  return x instanceof Lazy ? (v[k] = x.f(x.s)) : x;
 }
 
 function walk(v, path, from) {
   for (let k = from; k < path.length; k++) {
-    if (v === null || typeof v !== 'object' || !hasOwn(v, path[k])) return undefined;
-    v = v[path[k]];
+    const key = path[k];
+    if (v === null || typeof v !== 'object' || !hasOwn(v, key)) return undefined;
+    const x = v[key];
+    v = x instanceof Lazy ? (v[key] = x.f(x.s)) : x;
   }
   return v;
 }
@@ -1690,6 +1722,7 @@ const itself = (x) => x;
  */
 function buildSite(siteIn, templatesIn, files, esc) {
   slugCache = new Map();
+  foldCache = new Map();
   dateCache = new Map();
   escMemo = new Map();
 
@@ -1719,7 +1752,7 @@ function buildSite(siteIn, templatesIn, files, esc) {
   // 2. Front matter: a refused source is reported and dropped, and so is a draft.
   const sources = [];
   for (const f of mds) {
-    const s = { path: f.path, data: null, post: false, layout: '', slug: '', outDir: '', url: '', bodyJ: null, body: null, done: false, html: null, toc: null, excerpt: '', excerptJV: null, minutes: 0, wsrc: null, wkind: 0, tagRefs: null, newer: null, older: null };
+    const s = { path: f.path, data: null, post: false, layout: '', slug: '', outDir: '', url: '', bodyJ: null, body: null, done: false, html: null, toc: null, excerpt: '', excerptJV: null, minutes: 0, wsrc: null, wkind: 0, tagRefs: null, newer: null, older: null, dateLong: null };
     let fm;
     let j = null;
     if (esc) {
@@ -1884,24 +1917,22 @@ function buildSite(siteIn, templatesIn, files, esc) {
     if (!s.done) renderSource(s);
     return s.excerptJV ?? (s.excerptJV = jv(s.excerpt));
   };
+  // A source's long date, worked out once (its card and the links to it from its neighbours all show it).
+  const dateLongOf = (s) => s.dateLong ?? (s.dateLong = s.data.date === undefined ? '' : longDate(s.data.date));
   const cardOf = (s) => {
     const d = s.data;
     return {
       title: d.title,
       url: s.url,
       date: d.date ?? '',
-      date_long: d.date === undefined ? '' : longDate(d.date),
+      date_long: dateLongOf(s),
       summary: d.summary ?? '',
-      get excerpt() {
-        return excerptOf(s);
-      },
-      get reading_minutes() {
-        return minutesOf(s);
-      },
+      excerpt: new Lazy(excerptOf, s),
+      reading_minutes: new Lazy(minutesOf, s),
       tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
     };
   };
-  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
+  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: dateLongOf(s) });
   const cards = new Map();
   for (const p of posts) cards.set(p, cardOf(p));
   const site = { title: siteIn.title, base_url: base };
@@ -1950,9 +1981,7 @@ function buildSite(siteIn, templatesIn, files, esc) {
       date_long: card.date_long,
       summary: card.summary,
       excerpt: excerptOf(s),
-      get reading_minutes() {
-        return minutesOf(s);
-      },
+      reading_minutes: new Lazy(minutesOf, s),
       tags: card.tags,
       slug: s.slug,
       content: jv(s.html),
