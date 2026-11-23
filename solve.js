@@ -300,102 +300,107 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- Markdown (lib/markdown.js), writing JSON-escaped HTML
 
-function blankFrom(line, from) {
-  for (let i = from, n = line.length; i < n; i++) {
-    const c = line.charCodeAt(i);
+// The block rules read each line in place, as the range [a, b) of the body (b at its "\n" or the body's end), the way
+// lib/markdown.js reads the lines of src.split('\n'); no line is copied unless its text is needed.
+
+/** Whether s[a, b) is only spaces and tabs. */
+function blankR(s, a, b) {
+  for (let i = a; i < b; i++) {
+    const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** Whether `line` from `from` on holds a character a regular expression's . does not match. */
-function hasLT(line, from) {
+/** Whether s[a, b) holds a character a regular expression's . does not match. */
+function hasLTR(s, a, b) {
   if (BYTE) return false; // byte mode: no \n or \r in a line, and the input holds no U+2028 or U+2029
-  for (let i = from, n = line.length; i < n; i++) {
-    const c = line.charCodeAt(i);
+  for (let i = a; i < b; i++) {
+    const c = s.charCodeAt(i);
     if (c === 0x2028 || c === 0x2029 || c === 10 || c === 13) return true;
   }
   return false;
 }
 
-function fenceLang(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  let i = 3;
-  const n = line.length;
-  while (i < n) {
-    const c = line.charCodeAt(i);
+/** A fence's language (/^```([A-Za-z0-9_+-]*)[ \t]*$/) on line s[a, b), or null. */
+function fenceLangR(s, a, b) {
+  if (b - a < 3 || s.charCodeAt(a) !== 96 || s.charCodeAt(a + 1) !== 96 || s.charCodeAt(a + 2) !== 96) return null;
+  let i = a + 3;
+  while (i < b) {
+    const c = s.charCodeAt(i);
     if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
     else break;
   }
-  return blankFrom(line, i) ? line.slice(3, i) : null;
+  return blankR(s, i, b) ? s.slice(a + 3, i) : null;
 }
 
-const isFenceClose = (line) => line.charCodeAt(0) === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96 && blankFrom(line, 3);
+const isFenceCloseR = (s, a, b) => b - a >= 3 && s.charCodeAt(a) === 96 && s.charCodeAt(a + 1) === 96 && s.charCodeAt(a + 2) === 96 && blankR(s, a + 3, b);
 
+/** A heading's depth on line s[a, b) (its text left in headingText), or 0. */
 let headingText = '';
-function headingDepth(line) {
-  let h = 0;
-  const n = line.length;
-  while (h < n && line.charCodeAt(h) === 35) h++;
-  if (h === 0 || h > 6 || h === n) return 0;
-  let i = h;
-  let c = line.charCodeAt(i);
+function headingDepthR(s, a, b) {
+  let h = a;
+  while (h < b && s.charCodeAt(h) === 35) h++;
+  const depth = h - a;
+  if (depth === 0 || depth > 6 || h === b) return 0;
+  let c = s.charCodeAt(h);
   if (c !== 32 && c !== 9) return 0;
-  while (i < n && ((c = line.charCodeAt(i)) === 32 || c === 9)) i++;
-  let e = n;
-  while (e > i && ((c = line.charCodeAt(e - 1)) === 32 || c === 9)) e--;
-  if (e === i) return 0;
-  if (hasLT(line, i)) return 0;
-  headingText = line.slice(i, e);
-  return h;
+  let i = h;
+  while (i < b && ((c = s.charCodeAt(i)) === 32 || c === 9)) i++;
+  let e = b;
+  while (e > i && ((c = s.charCodeAt(e - 1)) === 32 || c === 9)) e--;
+  if (e === i || hasLTR(s, i, b)) return 0;
+  headingText = s.slice(i, e);
+  return depth;
 }
 
-const isHR = (line) => {
-  const c = line.charCodeAt(0);
-  return (c === 45 || c === 42) && line.charCodeAt(1) === c && line.charCodeAt(2) === c && blankFrom(line, 3);
+const isHRR = (s, a, b) => {
+  const c = s.charCodeAt(a);
+  return b - a >= 3 && (c === 45 || c === 42) && s.charCodeAt(a + 1) === c && s.charCodeAt(a + 2) === c && blankR(s, a + 3, b);
 };
 
-function endsParagraph(line) {
-  const c = line.charCodeAt(0);
-  if (c === 96) return fenceLang(line) !== null;
-  if (c === 35) return headingDepth(line) !== 0;
-  if (c === 45 || c === 42) return isHR(line);
-  if (c === 32 || c === 9 || line.length === 0) return blankFrom(line, 0);
+/** Whether line s[a, b) ends a paragraph: blank, a fence, a heading or a thematic break. */
+function endsParagraphR(s, a, b) {
+  if (a === b) return true;
+  const c = s.charCodeAt(a);
+  if (c === 96) return fenceLangR(s, a, b) !== null;
+  if (c === 35) return headingDepthR(s, a, b) !== 0;
+  if (c === 45 || c === 42) return isHRR(s, a, b);
+  if (c === 32 || c === 9) return blankR(s, a, b);
   return false;
 }
 
-function trimLine(line) {
-  const n = line.length;
-  let s = 0;
+/** s[a, b) with spaces and tabs at either end dropped. */
+function trimR(s, a, b) {
   let c;
-  while (s < n && ((c = line.charCodeAt(s)) === 32 || c === 9)) s++;
-  let e = n;
-  while (e > s && ((c = line.charCodeAt(e - 1)) === 32 || c === 9)) e--;
-  return s === 0 && e === n ? line : line.slice(s, e);
+  while (a < b && ((c = s.charCodeAt(a)) === 32 || c === 9)) a++;
+  while (b > a && ((c = s.charCodeAt(b - 1)) === 32 || c === 9)) b--;
+  return s.slice(a, b);
 }
 
-function bulletText(line) {
-  const c = line.charCodeAt(0);
-  if ((c !== 45 && c !== 42) || line.charCodeAt(1) !== 32 || hasLT(line, 2)) return null;
-  return line.slice(2);
+/** Where a bullet's text starts on line s[a, b) (/^[-*] (.*)$/), or -1. */
+function bulletAt(s, a, b) {
+  const c = s.charCodeAt(a);
+  if (b - a < 2 || (c !== 45 && c !== 42) || s.charCodeAt(a + 1) !== 32 || hasLTR(s, a + 2, b)) return -1;
+  return a + 2;
 }
 
-let orderedText = '';
-function orderedNumber(line) {
-  let i = 0;
-  const n = line.length;
+/** An ordered item's number on line s[a, b) (/^(\d{1,9})\. (.*)$/), its text's start left in orderedAt; or -1. */
+let orderedAt = 0;
+function orderedR(s, a, b) {
+  let i = a;
   let c;
-  while (i < n && (c = line.charCodeAt(i)) >= 48 && c <= 57) i++;
-  if (i === 0 || i > 9 || line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32 || hasLT(line, i + 2)) return -1;
-  orderedText = line.slice(i + 2);
-  return Number(line.slice(0, i));
+  while (i < b && (c = s.charCodeAt(i)) >= 48 && c <= 57) i++;
+  if (i === a || i - a > 9 || i + 1 >= b || s.charCodeAt(i) !== 46 || s.charCodeAt(i + 1) !== 32 || hasLTR(s, i + 2, b)) return -1;
+  orderedAt = i + 2;
+  return Number(s.slice(a, i));
 }
 
-function isContinued(line) {
-  let i = 0;
-  const n = line.length;
-  while (i < n && line.charCodeAt(i) === 32) i++;
-  return i >= 2 && i < n && !isWS(line.charCodeAt(i));
+/** /^ {2,}\S/ on line s[a, b). */
+function continuedR(s, a, b) {
+  let i = a;
+  while (i < b && s.charCodeAt(i) === 32) i++;
+  return i - a >= 2 && i < b && !isWS(s.charCodeAt(i));
 }
 
 const ESC_OK = new Uint8Array(128);
@@ -535,35 +540,47 @@ function inline(s, link) {
 }
 
 /** `src` rendered: { html, toc, excerpt }, html and every HTML in them JSON-escaped. */
-function renderMarkdown(src, link) {
-  const lines = src.split('\n');
-  const nLines = lines.length;
+function renderMarkdown(s, link) {
+  const N = s.length;
   let ids = null;
   let html = '';
   const toc = [];
   let excerpt = null;
-  let i = 0;
-  while (i < nLines) {
-    const line = lines[i];
-    const c0 = line.charCodeAt(0);
-    if (line.length === 0 || ((c0 === 32 || c0 === 9) && blankFrom(line, 1))) {
-      i++;
+  // The current line is s[a, b); a past N means the lines are done (src.split('\n') gives N's empty last line too).
+  let a = 0;
+  let b = s.indexOf('\n');
+  if (b === -1) b = N;
+  const next = () => {
+    a = b + 1;
+    if (a <= N) {
+      b = s.indexOf('\n', a);
+      if (b === -1) b = N;
+    }
+  };
+  while (a <= N) {
+    const c0 = a < b ? s.charCodeAt(a) : -1;
+    if (c0 === -1 || ((c0 === 32 || c0 === 9) && blankR(s, a + 1, b))) {
+      next();
       continue;
     }
     if (c0 === 96) {
-      const lang = fenceLang(line);
+      const lang = fenceLangR(s, a, b);
       if (lang !== null) {
-        i++;
-        const start = i;
-        while (i < nLines && !isFenceClose(lines[i])) i++;
+        next();
+        const start = a;
+        let end = -1;
+        while (a <= N && !isFenceCloseR(s, a, b)) {
+          end = b;
+          next();
+        }
         const cls = lang === '' ? '' : ` class=\\"language-${escHJ(lang)}\\"`;
-        html += `<pre><code${cls}>${i > start ? `${escHJ(lines.slice(start, i).join('\n'))}\\n` : ''}</code></pre>\\n`;
-        i++;
+        html += `<pre><code${cls}>${end !== -1 ? `${escHJ(s.slice(start, end))}\\n` : ''}</code></pre>\\n`;
+        if (a <= N) next();
         continue;
       }
     }
     if (c0 === 35) {
-      const depth = headingDepth(line);
+      const depth = headingDepthR(s, a, b);
       if (depth !== 0) {
         const text = headingText;
         if (ids === null) ids = new Set();
@@ -571,57 +588,77 @@ function renderMarkdown(src, link) {
         const h = inline(text, link);
         html += `<h${depth} id=\\"${id}\\">${h}</h${depth}>\\n`;
         if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: jv(h) });
-        i++;
+        next();
         continue;
       }
     }
-    if ((c0 === 45 || c0 === 42) && isHR(line)) {
+    if ((c0 === 45 || c0 === 42) && isHRR(s, a, b)) {
       html += '<hr>\\n';
-      i++;
+      next();
       continue;
     }
     if (c0 === 62) {
       let body = '';
       let any = false;
-      while (i < nLines && lines[i].charCodeAt(0) === 62) {
-        const l = lines[i++];
-        const t = trimLine(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
+      while (a <= N && a < b && s.charCodeAt(a) === 62) {
+        const t = trimR(s, a + 1 < b && s.charCodeAt(a + 1) === 32 ? a + 2 : a + 1, b);
         if (t !== '') {
           body = any ? `${body}\n${t}` : t;
           any = true;
         }
+        next();
       }
       html += any ? `<blockquote>\\n<p>${inline(body, link)}</p>\\n</blockquote>\\n` : '<blockquote>\\n</blockquote>\\n';
       continue;
     }
     if (c0 === 45 || c0 === 42 || (c0 >= 48 && c0 <= 57)) {
-      const bullet = c0 === 45 || c0 === 42 ? bulletText(line) : null;
-      const start = bullet === null && c0 >= 48 && c0 <= 57 ? orderedNumber(line) : -1;
-      if (bullet !== null || start !== -1) {
-        const ordered = bullet === null;
+      const bullet = c0 === 45 || c0 === 42 ? bulletAt(s, a, b) : -1;
+      const start = bullet === -1 && c0 >= 48 && c0 <= 57 ? orderedR(s, a, b) : -1;
+      if (bullet !== -1 || start !== -1) {
+        const ordered = bullet === -1;
         let items = '';
-        let item = ordered ? trimLine(orderedText) : trimLine(bullet);
-        i++;
-        while (i < nLines) {
-          const l = lines[i];
-          const t = ordered ? (orderedNumber(l) !== -1 ? orderedText : null) : bulletText(l);
-          if (t !== null) {
+        let item = trimR(s, ordered ? orderedAt : bullet, b);
+        next();
+        while (a <= N) {
+          const at = ordered ? (orderedR(s, a, b) !== -1 ? orderedAt : -1) : bulletAt(s, a, b);
+          if (at !== -1) {
             items += `<li>${inline(item, link)}</li>\\n`;
-            item = trimLine(t);
-            i++;
-          } else if (isContinued(l)) {
-            item += `\n${trimLine(l)}`;
-            i++;
-          } else break;
+            item = trimR(s, at, b);
+          } else if (continuedR(s, a, b)) item += `\n${trimR(s, a, b)}`;
+          else break;
+          next();
         }
         items += `<li>${inline(item, link)}</li>\\n`;
         html += ordered ? (start !== 1 ? `<ol start=\\"${start}\\">\\n${items}</ol>\\n` : `<ol>\\n${items}</ol>\\n`) : `<ul>\\n${items}</ul>\\n`;
         continue;
       }
     }
-    let text = trimLine(line);
-    i++;
-    while (i < nLines && !endsParagraph(lines[i])) text += `\n${trimLine(lines[i++])}`;
+    // A paragraph: its lines trimmed and joined by "\n"; when no line needs trimming that is s itself, sliced once.
+    let ta = a;
+    let tb = b;
+    let c;
+    while (ta < tb && ((c = s.charCodeAt(ta)) === 32 || c === 9)) ta++;
+    while (tb > ta && ((c = s.charCodeAt(tb - 1)) === 32 || c === 9)) tb--;
+    const first = ta;
+    let clean = ta === a && tb === b;
+    let text = clean ? '' : s.slice(ta, tb);
+    let lastEnd = tb;
+    next();
+    while (a <= N && !endsParagraphR(s, a, b)) {
+      ta = a;
+      tb = b;
+      while (ta < tb && ((c = s.charCodeAt(ta)) === 32 || c === 9)) ta++;
+      while (tb > ta && ((c = s.charCodeAt(tb - 1)) === 32 || c === 9)) tb--;
+      if (clean) {
+        if (ta === a && tb === b) lastEnd = tb;
+        else {
+          clean = false;
+          text = `${s.slice(first, lastEnd)}\n${s.slice(ta, tb)}`;
+        }
+      } else text += `\n${s.slice(ta, tb)}`;
+      next();
+    }
+    if (clean) text = s.slice(first, lastEnd);
     const h = inline(text, link);
     if (excerpt === null) excerpt = h;
     html += `<p>${h}</p>\\n`;
