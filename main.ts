@@ -4,9 +4,9 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
-// The house baseline's flag, and V8 tuned for a short, single-CPU run: no TurboFan (its compiles never pay back in a
-// run this short), a larger young generation (fewer scavenges).
-for (const flag of ['--no-incremental-marking', '--no-opt', '--min-semi-space-size=16', '--max-semi-space-size=64']) setFlagsFromString(flag);
+// The house baseline's flag, and V8 kept to one thread for a short, one-CPU run: no optimizing compilers (their
+// background compiles never pay back in a run this short) and a garbage collector that works on the main thread alone.
+for (const flag of ['--no-incremental-marking', '--no-opt', '--no-maglev', '--single-threaded-gc', '--no-parallel-scavenge', '--no-concurrent-marking', '--no-parallel-marking', '--no-concurrent-sweeping', '--no-parallel-compaction', '--no-parallel-pointer-update', '--no-concurrent-array-buffer-sweeping']) setFlagsFromString(flag);
 
 const { answerAll } = await import('./solve.js');
 const IN = process.env.MAKEFUN_INPUT_DIR ?? '/input';

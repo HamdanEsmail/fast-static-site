@@ -102,19 +102,31 @@ function jsTrim(s) {
   return a === 0 && e === n ? s : s.slice(a, e);
 }
 
+// A word is a run of non-whitespace (index.js's /\S+/g). Counted natively, 32 words a regular-expression call: a
+// sticky pattern steps over 32 words, each with the whitespace after it (a word must end at whitespace, so no word is
+// ever split), and the last few words are counted by turning each into one "x". Byte mode classes only ASCII as
+// whitespace (a UTF-8 byte such as 0xA0 is no space), and the input holds no Unicode whitespace there.
+const LEAD_B = /[\t-\r ]*/y;
+const WORDS32_B = /(?:[^\t-\r ]+[\t-\r ]+){32}/y;
+const WORD_B = /[^\t-\r ]+[\t-\r ]*/g;
+const LEAD_U = /\s*/y;
+const WORDS32_U = /(?:\S+\s+){32}/y;
+const WORD_U = /\S+\s*/g;
+
 /** The number of runs of non-whitespace in `s`. */
 function wordCount(s) {
+  const lead = BYTE ? LEAD_B : LEAD_U;
+  const chunk = BYTE ? WORDS32_B : WORDS32_U;
+  lead.lastIndex = 0;
+  lead.test(s);
+  let p = lead.lastIndex; // the first word's start, or the end
   let words = 0;
-  let inWord = false;
-  for (let i = 0, n = s.length; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (c <= 32 ? c === 32 || (c >= 9 && c <= 13) : !BYTE && c >= 160 && isUniWS(c)) inWord = false;
-    else if (!inWord) {
-      inWord = true;
-      words++;
-    }
+  chunk.lastIndex = p;
+  while (chunk.test(s)) {
+    words += 32;
+    p = chunk.lastIndex;
   }
-  return words;
+  return p < s.length ? words + s.slice(p).replace(BYTE ? WORD_B : WORD_U, 'x').length : words;
 }
 
 /** A byte-mode string's characters (UTF-8 decoded), or `s` itself in UTF-16 mode. */
@@ -126,14 +138,20 @@ const SLUG_MAX = 64;
 const MARKS = /\p{M}/gu;
 let slugCache = new Map();
 
+const NOT_SLUG = /[^a-z0-9]+/g;
+const NOT_ASCII = /[^\u0000-\u007f]/;
+
 function slugifyRaw(text) {
-  let plain = text;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) > 127) {
-      plain = chars(text).normalize('NFKD').replace(MARKS, '');
-      break;
-    }
+  if (!NOT_ASCII.test(text)) {
+    // ASCII: lower A-Z, every run of other characters one "-", none at either end, at most 64 characters.
+    const r = text.toLowerCase().replace(NOT_SLUG, '-');
+    const a = r.charCodeAt(0) === 45 ? 1 : 0;
+    let e = r.length;
+    if (e - a > SLUG_MAX) e = a + SLUG_MAX;
+    while (e > a && r.charCodeAt(e - 1) === 45) e--;
+    return e === a ? 'untitled' : a === 0 && e === r.length ? r : r.slice(a, e);
   }
+  const plain = chars(text).normalize('NFKD').replace(MARKS, '');
   let out = '';
   let gap = false;
   for (let i = 0, n = plain.length; i < n; i++) {
@@ -464,18 +482,18 @@ IT[91] = 2;
  * `s` rendered inline, as JSON-escaped HTML; `link(target)` is a link's href (plain text). One pass: plain runs are
  * copied whole, escaped chars replaced as they are met, markers rendered as lib/markdown.js's inline() renders them.
  */
+const SPECIAL = /[\u0000-\u001f"&'<>*[\\`]/g;
 function inline(s, link) {
   const n = s.length;
   let out = '';
   let run = 0; // the start of the plain text not yet copied to out
   let i = 0;
-  while (i < n) {
+  for (;;) {
+    SPECIAL.lastIndex = i;
+    if (!SPECIAL.test(s)) break;
+    i = SPECIAL.lastIndex - 1;
     const c = s.charCodeAt(i);
-    const t = c < 128 ? IT[c] : 0;
-    if (t === 0) {
-      i++;
-      continue;
-    }
+    const t = IT[c];
     if (t === 1) {
       out += i > run ? s.slice(run, i) + HJ[c] : HJ[c];
       run = ++i;
@@ -550,32 +568,31 @@ function renderMarkdown(s, link) {
   let a = 0;
   let b = s.indexOf('\n');
   if (b === -1) b = N;
-  const next = () => {
-    a = b + 1;
-    if (a <= N) {
-      b = s.indexOf('\n', a);
-      if (b === -1) b = N;
-    }
-  };
   while (a <= N) {
     const c0 = a < b ? s.charCodeAt(a) : -1;
     if (c0 === -1 || ((c0 === 32 || c0 === 9) && blankR(s, a + 1, b))) {
-      next();
+      a = b + 1;
+      if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
       continue;
     }
     if (c0 === 96) {
       const lang = fenceLangR(s, a, b);
       if (lang !== null) {
-        next();
+        a = b + 1;
+        if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
         const start = a;
         let end = -1;
         while (a <= N && !isFenceCloseR(s, a, b)) {
           end = b;
-          next();
+          a = b + 1;
+          if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
         }
         const cls = lang === '' ? '' : ` class=\\"language-${escHJ(lang)}\\"`;
         html += `<pre><code${cls}>${end !== -1 ? `${escHJ(s.slice(start, end))}\\n` : ''}</code></pre>\\n`;
-        if (a <= N) next();
+        if (a <= N) {
+          a = b + 1;
+          if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
+        }
         continue;
       }
     }
@@ -588,13 +605,15 @@ function renderMarkdown(s, link) {
         const h = inline(text, link);
         html += `<h${depth} id=\\"${id}\\">${h}</h${depth}>\\n`;
         if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: jv(h) });
-        next();
+        a = b + 1;
+        if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
         continue;
       }
     }
     if ((c0 === 45 || c0 === 42) && isHRR(s, a, b)) {
       html += '<hr>\\n';
-      next();
+      a = b + 1;
+      if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
       continue;
     }
     if (c0 === 62) {
@@ -606,7 +625,8 @@ function renderMarkdown(s, link) {
           body = any ? `${body}\n${t}` : t;
           any = true;
         }
-        next();
+        a = b + 1;
+        if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
       }
       html += any ? `<blockquote>\\n<p>${inline(body, link)}</p>\\n</blockquote>\\n` : '<blockquote>\\n</blockquote>\\n';
       continue;
@@ -618,7 +638,8 @@ function renderMarkdown(s, link) {
         const ordered = bullet === -1;
         let items = '';
         let item = trimR(s, ordered ? orderedAt : bullet, b);
-        next();
+        a = b + 1;
+        if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
         while (a <= N) {
           const at = ordered ? (orderedR(s, a, b) !== -1 ? orderedAt : -1) : bulletAt(s, a, b);
           if (at !== -1) {
@@ -626,7 +647,8 @@ function renderMarkdown(s, link) {
             item = trimR(s, at, b);
           } else if (continuedR(s, a, b)) item += `\n${trimR(s, a, b)}`;
           else break;
-          next();
+          a = b + 1;
+          if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
         }
         items += `<li>${inline(item, link)}</li>\\n`;
         html += ordered ? (start !== 1 ? `<ol start=\\"${start}\\">\\n${items}</ol>\\n` : `<ol>\\n${items}</ol>\\n`) : `<ul>\\n${items}</ul>\\n`;
@@ -643,8 +665,13 @@ function renderMarkdown(s, link) {
     let clean = ta === a && tb === b;
     let text = clean ? '' : s.slice(ta, tb);
     let lastEnd = tb;
-    next();
-    while (a <= N && !endsParagraphR(s, a, b)) {
+    a = b + 1;
+    if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
+    while (a <= N) {
+      // Only an empty line, or one opening on ` # - * space or tab, can end a paragraph.
+      if (a === b) break;
+      c = s.charCodeAt(a);
+      if ((c === 96 || c === 35 || c === 45 || c === 42 || c === 32 || c === 9) && endsParagraphR(s, a, b)) break;
       ta = a;
       tb = b;
       while (ta < tb && ((c = s.charCodeAt(ta)) === 32 || c === 9)) ta++;
@@ -656,7 +683,8 @@ function renderMarkdown(s, link) {
           text = `${s.slice(first, lastEnd)}\n${s.slice(ta, tb)}`;
         }
       } else text += `\n${s.slice(ta, tb)}`;
-      next();
+      a = b + 1;
+      if (a <= N && (b = s.indexOf('\n', a)) === -1) b = N;
     }
     if (clean) text = s.slice(first, lastEnd);
     const h = inline(text, link);
@@ -993,6 +1021,24 @@ const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const NON_ASCII = /[^\u0000-\u007f]/;
 
 function resolvePath(dir, rel) {
+  // The usual shape, without arrays: "../" some number of times, then plain names (none "", "." or "..").
+  let p = 0;
+  while (rel.charCodeAt(p) === 46 && rel.charCodeAt(p + 1) === 46 && rel.charCodeAt(p + 2) === 47) p += 3;
+  const rest = p === 0 ? rel : rel.slice(p);
+  const last = rest.charCodeAt(rest.length - 1);
+  if (rest !== '' && rest.charCodeAt(0) !== 47 && last !== 47 && last !== 46 && rest.indexOf('//') === -1 && rest.indexOf('./') === -1) {
+    let d = dir;
+    let has = dir !== ''; // whether a part of dir is left to climb out of
+    for (let k = p; k > 0; k -= 3) {
+      if (!has) return null;
+      const sl = d.lastIndexOf('/');
+      if (sl === -1) {
+        d = '';
+        has = false;
+      } else d = d.slice(0, sl);
+    }
+    return has ? `${d}/${rest}` : rest;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -1377,3 +1423,4 @@ export function run(input) {
 }
 
 export const build = run;
+
