@@ -105,10 +105,11 @@ function isWS(c) {
   return !BYTE && c >= 160 && isUniWS(c);
 }
 
-function hasWS(s) {
-  for (let i = 0; i < s.length; i++) if (isWS(s.charCodeAt(i))) return true;
-  return false;
-}
+const WS_B = /[\t-\r ]/;
+const WS_U = /\s/;
+
+/** Whether `s` holds whitespace (/\s/; in byte mode only ASCII can be). */
+const hasWS = (s) => (BYTE ? WS_B : WS_U).test(s);
 
 /** String.prototype.trim, as the UTF-16 text would read it. */
 function jsTrim(s) {
@@ -739,6 +740,25 @@ const APOS_G = /'/g;
 const EQUOT_G = /\\"/g;
 const CR_G = /\\r(?:\\n)?/g;
 const NL_UNIT_G = /\\n/g;
+// A JSON-escaped body into the escaped domain: a literal backslash (\\) first, so that the \" after one is never
+// read as its own; then the characters HTML escapes. The search goes left to right over whole JSON escapes: at a
+// backslash it takes \\ or \" or, for any other escape, nothing, and moves on.
+const TO_E_G = /\\\\|[&<>']|\\"/g;
+function toE(m) {
+  switch (m.charCodeAt(0)) {
+    case 38:
+      return '&amp;';
+    case 60:
+      return '&lt;';
+    case 62:
+      return '&gt;';
+    case 39:
+      return '&#39;';
+    default:
+      return m.charCodeAt(1) === 92 ? '\x01' : '&quot;';
+  }
+}
+
 /** A JSON escape other than \n left in an escaped-domain body. */
 const ODD_UNIT = /\\[^n]/;
 const E_MARK = /[`*[\x01]/g;
@@ -798,55 +818,66 @@ function escLenE(s, i) {
   return c < 128 && ESC_E[c] === 1 ? 1 : 0;
 }
 
+// The three searches of lib/markdown.js (findUnescaped for "**" and "]", findSingleStar), by native search: the next
+// candidate is found with indexOf, and only a literal backslash before it (which may escape it) is stepped over by hand.
+
+/** Whether the body being rendered holds a literal backslash at all (set per body: most hold none). */
+let BODY_HAS_BS = true;
+
 function findDoubleStarE(s, from) {
-  if (s.indexOf('**', from) === -1) return -1;
-  const n = s.length;
-  for (let j = from; j <= n - 2; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 1) {
-      j += escLenE(s, j + 1);
-      continue;
+  let j = from;
+  for (;;) {
+    const q = s.indexOf('**', j);
+    if (q === -1) return -1;
+    if (BODY_HAS_BS) {
+      const b = s.indexOf('\x01', j);
+      if (b !== -1 && b < q) {
+        j = b + 1 + escLenE(s, b + 1);
+        continue;
+      }
     }
-    if (c === 42 && s.charCodeAt(j + 1) === 42) return j;
+    return q;
   }
-  return -1;
 }
 
 function findSingleStarE(s, from) {
-  if (s.indexOf('*', from) === -1) return -1;
-  const n = s.length;
-  for (let j = from; j < n; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 1) {
-      j += escLenE(s, j + 1);
+  let j = from;
+  for (;;) {
+    const q = s.indexOf('*', j);
+    if (q === -1) return -1;
+    if (BODY_HAS_BS) {
+      const b = s.indexOf('\x01', j);
+      if (b !== -1 && b < q) {
+        j = b + 1 + escLenE(s, b + 1);
+        continue;
+      }
+    }
+    if (s.charCodeAt(q + 1) === 42) {
+      j = q + 2;
       continue;
     }
-    if (c !== 42) continue;
-    if (s.charCodeAt(j + 1) === 42) {
-      j++;
-      continue;
-    }
-    return j;
+    return q;
   }
-  return -1;
 }
 
 function findCloseE(s, from) {
-  if (s.indexOf(']', from) === -1) return -1;
-  const n = s.length;
-  for (let j = from; j < n; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 1) {
-      j += escLenE(s, j + 1);
-      continue;
+  let j = from;
+  for (;;) {
+    const q = s.indexOf(']', j);
+    if (q === -1) return -1;
+    if (BODY_HAS_BS) {
+      const b = s.indexOf('\x01', j);
+      if (b !== -1 && b < q) {
+        j = b + 1 + escLenE(s, b + 1);
+        continue;
+      }
     }
-    if (c === 93) return j;
+    return q;
   }
-  return -1;
 }
 
 /** An escaped-domain string as the answer writes it: each literal backslash (\x01) the JSON escape \\. */
-const bsOut = (t) => (t.indexOf('\x01') === -1 ? t : t.replace(BS1_G, '\\\\'));
+const bsOut = (t) => (BODY_HAS_BS && t.indexOf('\x01') !== -1 ? t.replace(BS1_G, '\\\\') : t);
 
 /** lib/markdown.js's inline() on an escaped-domain string: only the markers are looked at, the rest is copied. */
 function inlineE(s, link) {
@@ -980,7 +1011,8 @@ function renderMarkdownE(E, link) {
         const text = m[2];
         const depth = m[1].length;
         if (ids === null) ids = new Set();
-        const id = uniqueSlug(slugify(E_NEEDS_UNESC.test(text) ? unescE(text) : text), ids);
+        // Not remembered in the build's slug cache: its key, cut from this body, would keep the whole body alive.
+        const id = uniqueSlug(slugifyRaw(E_NEEDS_UNESC.test(text) ? unescE(text) : text), ids);
         const h = inlineE(text, link);
         html += `<h${depth} id=\\"${id}\\">${h}</h${depth}>\\n`;
         if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: jv(h) });
@@ -1089,24 +1121,25 @@ function renderMarkdownE(E, link) {
   return { html, toc, excerpt: excerpt ?? '' };
 }
 
-// A word in a body whose line breaks are spaces: 32 words a call, as wordCount counts them.
-const LEAD_S = / */y;
-const WORDS32_S = /(?:[^ ]+ +){32}/y;
-const WORD_S = /[^ ]+ */g;
+// A page's reading minutes are max(1, ceil(words / 200)), so the words need not be counted one by one: a sticky
+// pattern steps over 200 words at a time, each with the whitespace after it (a space or the escape \n; a word must
+// end at whitespace, so none is ever split), and whatever is left after the last full step is one more minute.
+const LEAD_E = /(?: |\\n)*/y;
+const WORDS200_E = /(?:[^ \\]+(?: |\\n)+){200}/y;
 
-/** The words of the body `p` (JSON-escaped, its only escapes \n, \" and the byte \x01 for a literal backslash). */
-function wordCountP(p) {
-  const s = p.replace(NL_UNIT_G, ' ');
-  LEAD_S.lastIndex = 0;
-  LEAD_S.test(s);
-  let at = LEAD_S.lastIndex;
-  let words = 0;
-  WORDS32_S.lastIndex = at;
-  while (WORDS32_S.test(s)) {
-    words += 32;
-    at = WORDS32_S.lastIndex;
+/** The reading minutes of an escaped-domain body `e` (its only whitespace spaces and \n escapes). */
+function minutesE(e) {
+  LEAD_E.lastIndex = 0;
+  LEAD_E.test(e);
+  let at = LEAD_E.lastIndex; // the first word's start, or the end
+  let minutes = 0;
+  WORDS200_E.lastIndex = at;
+  while (WORDS200_E.test(e)) {
+    minutes++;
+    at = WORDS200_E.lastIndex;
   }
-  return at < s.length ? words + s.slice(at).replace(WORD_S, 'x').length : words;
+  if (at < e.length) minutes++;
+  return minutes === 0 ? 1 : minutes;
 }
 
 // Where a JSON-escaped source's front matter ends, for the lines of lib/frontmatter.js's parseFrontMatter.
@@ -1314,6 +1347,8 @@ function resolve(env, path) {
     if (first === 'loop') {
       if (fr.known) return { known: true, value: walk(loopOf(fr.k, fr.n), path, 1) };
       const slot = fr.slot;
+      // A body that reads where its element stands in the loop is no function of the element alone.
+      if (env.pure != null && env.pure.slot === slot) env.pure.ok = false;
       if (path.length === 1) return { known: false, get: (R, F) => loopOf(F[slot].k, F[slot].n) };
       const key = path[1];
       if (path.length > 2 || (key !== 'index' && key !== 'first' && key !== 'last' && key !== 'length')) return { known: true, value: undefined };
@@ -1336,6 +1371,7 @@ function resolve(env, path) {
   const root = hasOwn(env.roots, first) ? env.roots[first] : null;
   if (root === null) return { known: true, value: undefined };
   if (root.known) return { known: true, value: walk(root.value, path, 1) };
+  if (env.pure != null) env.pure.ok = false;
   if (path.length === 1) return { known: false, get: (R) => R[first] };
   if (path.length === 2) {
     const k1 = path[1];
@@ -1428,13 +1464,35 @@ function compileNodes(nodes, env, depth, templates) {
           const len = xs.length;
           for (let k = 0; k < len; k++) {
             const frames = env.frames.concat([{ name: n.name, known: true, x: xs[k], k, n: len }]);
-            pieces.push(compileNodes(n.body, { roots: env.roots, frames }, depth, templates));
+            pieces.push(compileNodes(n.body, { roots: env.roots, frames, memos: env.memos, pure: env.pure }, depth, templates));
           }
         } else {
           const get = r.get;
           const slot = env.frames.length;
           const frames = env.frames.concat([{ name: n.name, known: false, slot }]);
-          const body = compileNodes(n.body, { roots: env.roots, frames }, depth, templates);
+          // An outermost loop's body that reads nothing but its element (not its place in the loop, no value of the
+          // page being rendered) writes the same text for the same element wherever it runs: a post's card on the
+          // index and on each of its tags' pages. Such a body is rendered once an element and remembered (env.memos,
+          // one build's; bodies are told apart by their source, their variable and the include depth).
+          const memoable = slot === 0 && env.memos != null;
+          const pure = memoable ? { ok: true, slot } : env.pure;
+          let body = compileNodes(n.body, { roots: env.roots, frames, memos: env.memos, pure }, depth, templates);
+          if (memoable && pure.ok && typeof body !== 'string') {
+            const key = `${depth}\u0000${n.name}\u0000${JSON.stringify(n.body)}`;
+            let memo = env.memos.get(key);
+            if (memo === undefined) env.memos.set(key, (memo = new Map()));
+            const fresh = body;
+            body = (R, F) => {
+              const x = F[0].x;
+              let text = memo.get(x);
+              if (text === undefined) {
+                text = fresh(R, F);
+                text.charCodeAt(0); // read once, so the pieces it was joined from are made one flat string
+                memo.set(x, text);
+              }
+              return text;
+            };
+          }
           if (typeof body === 'string') {
             pieces.push((R, F) => {
               const xs = get(R, F);
@@ -1633,11 +1691,10 @@ function buildSite(siteIn, templatesIn, files, esc) {
   const staticPaths = new Set();
   for (const f of statics) staticPaths.add(f.path);
   const broken = new Set();
-  const linkMemo = new Map();
   const minutesOf = (s) => {
     if (!s.done) renderSource(s);
     if (s.minutes === 0) {
-      s.minutes = Math.max(1, Math.ceil((s.wkind === 1 ? wordCountP(s.wsrc) : wordCount(s.wsrc)) / 200));
+      s.minutes = s.wkind === 1 ? minutesE(s.wsrc) : Math.max(1, Math.ceil(wordCount(s.wsrc) / 200));
       s.wsrc = null;
     }
     return s.minutes;
@@ -1646,18 +1703,14 @@ function buildSite(siteIn, templatesIn, files, esc) {
     s.done = true;
     const dir = dirOf(s.path);
     const src = s.path;
-    let memo = linkMemo.get(dir);
-    if (memo === undefined) linkMemo.set(dir, (memo = new Map()));
     const link = (target) => {
       const c = target.charCodeAt(0);
       if (c === 47 || c === 35) return target;
-      let r = memo.get(target);
-      if (r === undefined) {
-        r = resolveLink(target, dir, bySource, staticPaths, base);
-        memo.set(target, r);
-      }
+      const r = resolveLink(target, dir, bySource, staticPaths, base);
       if (r === null) {
-        broken.add(`broken-link ${src} -> ${target}`);
+        const line = `broken-link ${src} -> ${target}`;
+        line.charCodeAt(0); // read once, so it is one flat string of its own and keeps no body alive
+        broken.add(line);
         return target;
       }
       return r;
@@ -1666,8 +1719,8 @@ function buildSite(siteIn, templatesIn, files, esc) {
     if (esc) {
       const bj = s.bodyJ;
       s.bodyJ = null;
-      const p = bj.replace(PAIR_G, '\x01');
-      const e = p.replace(AMP_G, '&amp;').replace(LT_G, '&lt;').replace(GT_G, '&gt;').replace(APOS_G, '&#39;').replace(EQUOT_G, '&quot;');
+      // The body into the escaped domain, in one pass (one new string, where six replaces would make six).
+      const e = bj.replace(TO_E_G, toE);
       if (e.indexOf('"') !== -1 || e.charCodeAt(e.length - 1) === 92) throw FALLBACK;
       if (ODD_UNIT.test(e)) {
         // An escape the fast path does not read (a tab, say): this body goes the decoded way.
@@ -1681,8 +1734,9 @@ function buildSite(siteIn, templatesIn, files, esc) {
         s.wsrc = raw;
         stats.slowDocs++;
       } else {
+        BODY_HAS_BS = e.indexOf('\x01') !== -1;
         md = renderMarkdownE(e, link);
-        s.wsrc = p;
+        s.wsrc = e;
         s.wkind = 1;
         stats.fastDocs++;
       }
@@ -1693,7 +1747,9 @@ function buildSite(siteIn, templatesIn, files, esc) {
     }
     s.html = md.html;
     s.toc = md.toc;
-    s.excerpt = md.excerpt;
+    // The excerpt outlives its page (the list pages show it), so it is copied out of the body's text: a string cut
+    // from the body would keep the whole body alive with it.
+    s.excerpt = md.excerpt === '' ? '' : ` ${md.excerpt}`.slice(1);
     if (s.post) minutesOf(s);
   };
 
@@ -1772,6 +1828,7 @@ function buildSite(siteIn, templatesIn, files, esc) {
   const dyn = { known: false };
   const constRoots = { site: known(site), tags: known(allTags), recent: known(recent) };
   const compiled = new Map();
+  const memos = new Map();
   const compile = (name, kind) => {
     const key = `${kind}\u0000${name}`;
     let c = compiled.get(key);
@@ -1782,7 +1839,8 @@ function buildSite(siteIn, templatesIn, files, esc) {
         roots.posts = dyn;
         roots.pager = dyn;
       } else if (kind === 'tag') roots.tag = dyn;
-      c = compileNodes(templates.get(name), { roots, frames: [] }, 0, templates);
+      // The list pages (index, tag) share what their loops write for one post; a page's own loops run once each.
+      c = compileNodes(templates.get(name), { roots, frames: [], memos: kind === 'page' ? null : memos, pure: null }, 0, templates);
       compiled.set(key, c);
     }
     return c;
