@@ -160,6 +160,7 @@ const MARKS = /\p{M}/gu;
 let slugCache = new Map();
 
 const NOT_SLUG = /[^a-z0-9]+/g;
+const NOT_SLUG_ANY = /[^A-Za-z0-9]+/g;
 const NOT_ASCII = /[^\u0000-\u007f]/;
 
 function slugifyRaw(text) {
@@ -172,25 +173,14 @@ function slugifyRaw(text) {
     while (e > a && r.charCodeAt(e - 1) === 45) e--;
     return e === a ? 'untitled' : a === 0 && e === r.length ? r : r.slice(a, e);
   }
-  const plain = chars(text).normalize('NFKD').replace(MARKS, '');
-  let out = '';
-  let gap = false;
-  for (let i = 0, n = plain.length; i < n; i++) {
-    let c = plain.charCodeAt(i);
-    if (c >= 65 && c <= 90) c += 32;
-    else if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57))) {
-      gap = out.length > 0;
-      continue;
-    }
-    if (gap) out += '-';
-    gap = false;
-    out += String.fromCharCode(c);
-  }
-  if (out.length > SLUG_MAX) out = out.slice(0, SLUG_MAX);
-  let end = out.length;
-  while (end > 0 && out.charCodeAt(end - 1) === 45) end--;
-  if (end !== out.length) out = out.slice(0, end);
-  return out === '' ? 'untitled' : out;
+  // Decomposed and its marks dropped, every run of anything but ASCII letters and digits becomes one "-": what is
+  // left is ASCII, so lowering it lowers A-Z and nothing else. Then as above.
+  const r = chars(text).normalize('NFKD').replace(MARKS, '').replace(NOT_SLUG_ANY, '-').toLowerCase();
+  const a = r.charCodeAt(0) === 45 ? 1 : 0;
+  let e = r.length;
+  if (e - a > SLUG_MAX) e = a + SLUG_MAX;
+  while (e > a && r.charCodeAt(e - 1) === 45) e--;
+  return e === a ? 'untitled' : a === 0 && e === r.length ? r : r.slice(a, e);
 }
 
 /** The slug of `text` (README.md, "Text"), memoised within the build. */
@@ -743,7 +733,13 @@ const NL_UNIT_G = /\\n/g;
 // A JSON-escaped body into the escaped domain: a literal backslash (\\) first, so that the \" after one is never
 // read as its own; then the characters HTML escapes. The search goes left to right over whole JSON escapes: at a
 // backslash it takes \\ or \" or, for any other escape, nothing, and moves on.
-const TO_E_G = /\\\\|[&<>']|\\"/g;
+// The same pass notes what else the body holds, so nothing has to search it again: a literal backslash (E_HAS_BS),
+// a JSON escape other than \n, \" and \\ (E_ODD: a tab, say), and a quote that no backslash escapes (E_BADQ: the text
+// is not one whole JSON string). Both of those are left as they stand.
+const TO_E_G = /\\\\|\\"|\\[^n]|[&<>'"]/g;
+let E_HAS_BS = false;
+let E_ODD = false;
+let E_BADQ = false;
 function toE(m) {
   switch (m.charCodeAt(0)) {
     case 38:
@@ -754,14 +750,28 @@ function toE(m) {
       return '&gt;';
     case 39:
       return '&#39;';
-    default:
-      return m.charCodeAt(1) === 92 ? '\x01' : '&quot;';
+    case 34:
+      E_BADQ = true;
+      return m;
+    default: {
+      const d = m.charCodeAt(1);
+      if (d === 92) {
+        E_HAS_BS = true;
+        return '\x01';
+      }
+      if (d === 34) return '&quot;';
+      E_ODD = true;
+      return m;
+    }
   }
 }
 
-/** A JSON escape other than \n left in an escaped-domain body. */
-const ODD_UNIT = /\\[^n]/;
 const E_MARK = /[`*[\x01]/g;
+// A strong or an emphasis whose text holds no marker, and a link whose text holds none and whose target has nothing
+// to unescape and no space: what lib/markdown.js makes of each follows from its shape alone, so one sticky match
+// stands in for its searches (the closing marker is the first one there is, and the text inside is copied as it is).
+const E_SIMPLE_STAR = /\*\*[^`*[\x01]+\*\*|\*[^`*[\x01]+\*(?!\*)/y;
+const E_SIMPLE_LINK = /\[[^`*[\]\x01]*\]\([^)&\\\x01 ]+\)/y;
 const E_UNESC = /&(?:amp|lt|gt|quot|#39);|\\n|\x01/g;
 const E_NEEDS_UNESC = /[&\\\x01]/;
 const FENCE_OPEN_E = /^```([A-Za-z0-9_+-]*) *$/;
@@ -789,9 +799,17 @@ const unescE = (t) => t.replace(E_UNESC, unescUnit);
 
 /** Whether the JSON string body `j` holds no unescaped quote and no dangling backslash: it is one whole string. */
 function cleanJ(j) {
-  if (j.indexOf('"') === -1 && j.charCodeAt(j.length - 1) !== 92) return true;
-  const p = j.replace(PAIR_G, '').replace(EQUOT_G, '');
-  return p.indexOf('"') === -1 && p.charCodeAt(p.length - 1) !== 92;
+  // A quote is escaped when an odd run of backslashes stands before it (each pair of them is a literal backslash),
+  // and the text ends inside an escape when an odd run of them ends it.
+  for (let q = j.indexOf('"'); q !== -1; q = j.indexOf('"', q + 1)) {
+    let b = q;
+    while (b > 0 && j.charCodeAt(b - 1) === 92) b--;
+    if (((q - b) & 1) === 0) return false;
+  }
+  const n = j.length;
+  let b = n;
+  while (b > 0 && j.charCodeAt(b - 1) === 92) b--;
+  return ((n - b) & 1) === 0;
 }
 
 /** The index of the next line break (the JSON escape \n, not a literal backslash before an n) in `j` from `from`, or -1. */
@@ -911,7 +929,13 @@ function inlineE(s, link) {
         run = i = j + 1;
       } else i++;
     } else if (c === 42) {
-      if (s.charCodeAt(i + 1) === 42) {
+      E_SIMPLE_STAR.lastIndex = i;
+      if (E_SIMPLE_STAR.test(s)) {
+        const end = E_SIMPLE_STAR.lastIndex;
+        if (i > run) out += s.slice(run, i);
+        out += s.charCodeAt(i + 1) === 42 ? `<strong>${s.slice(i + 2, end - 2)}</strong>` : `<em>${s.slice(i + 1, end - 1)}</em>`;
+        run = i = end;
+      } else if (s.charCodeAt(i + 1) === 42) {
         const j = findDoubleStarE(s, i + 2);
         if (j > i + 2) {
           if (i > run) out += s.slice(run, i);
@@ -928,10 +952,19 @@ function inlineE(s, link) {
       }
     } else {
       // [
-      const k = findCloseE(s, i + 1);
-      const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
+      E_SIMPLE_LINK.lastIndex = i;
+      const simple = E_SIMPLE_LINK.test(s);
+      const k = simple ? s.indexOf('](', i + 1) : findCloseE(s, i + 1);
+      const m = simple ? E_SIMPLE_LINK.lastIndex - 1 : k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       let linked = false;
-      if (m !== -1) {
+      if (simple) {
+        const te = s.slice(k + 2, m);
+        if (i > run) out += s.slice(run, i);
+        const href = link(te);
+        out += `<a href=\\"${href === te ? te : escHJ(href)}\\">${s.slice(i + 1, k)}</a>`;
+        run = i = m + 1;
+        linked = true;
+      } else if (m !== -1) {
         const te = s.slice(k + 2, m);
         const target = E_NEEDS_UNESC.test(te) ? unescE(te) : te;
         if (target !== '' && !hasWS(target)) {
@@ -1770,9 +1803,10 @@ function buildSite(siteIn, templatesIn, files, esc) {
       const bj = s.bodyJ;
       s.bodyJ = null;
       // The body into the escaped domain, in one pass (one new string, where six replaces would make six).
+      E_HAS_BS = E_ODD = E_BADQ = false;
       const e = bj.replace(TO_E_G, toE);
-      if (e.indexOf('"') !== -1 || e.charCodeAt(e.length - 1) === 92) throw FALLBACK;
-      if (ODD_UNIT.test(e)) {
+      if (E_BADQ || e.charCodeAt(e.length - 1) === 92) throw FALLBACK;
+      if (E_ODD) {
         // An escape the fast path does not read (a tab, say): this body goes the decoded way.
         let raw;
         try {
@@ -1784,7 +1818,7 @@ function buildSite(siteIn, templatesIn, files, esc) {
         s.wsrc = raw;
         stats.slowDocs++;
       } else {
-        BODY_HAS_BS = e.indexOf('\x01') !== -1;
+        BODY_HAS_BS = E_HAS_BS;
         md = renderMarkdownE(e, link);
         s.wsrc = e;
         s.wkind = 1;
