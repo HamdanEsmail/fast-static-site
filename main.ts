@@ -6,7 +6,7 @@ import { setFlagsFromString } from 'node:v8';
 
 // The house baseline's flag, and V8 kept to one thread for a short, one-CPU run: no optimizing compilers (their
 // background compiles never pay back in a run this short) and young-generation collections on the main thread alone.
-for (const flag of ['--no-incremental-marking', '--no-opt', '--no-maglev', '--no-parallel-scavenge', '--always-sparkplug']) setFlagsFromString(flag);
+for (const flag of ['--no-incremental-marking', '--no-opt', '--no-maglev', '--no-parallel-scavenge']) setFlagsFromString(flag);
 
 const { answerAll } = await import('./solve.js');
 const IN = process.env.MAKEFUN_INPUT_DIR ?? '/input';
